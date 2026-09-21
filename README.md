@@ -88,10 +88,13 @@ Todas as operações respeitam as permissões Linux da conta autenticada. A inte
 
 - Cada navegador terá uma sessão independente no backend.
 - Uma mesma conta SFTP poderá ser usada em conexões simultâneas.
-- As credenciais serão mantidas somente na memória do backend e associadas a um identificador de sessão.
+- Um navegador poderá manter vários servidores cadastrados, cada um com um identificador próprio associado à sessão web.
+- As configurações e credenciais serão mantidas somente na memória do backend e associadas a um cookie de sessão `HttpOnly`.
 - A senha não será salva em banco de dados, arquivo, `localStorage` ou `sessionStorage`.
-- A sessão será encerrada após **30 minutos de inatividade** ou quando o usuário clicar em **Desconectar**.
-- Ao encerrar a sessão, a conexão SFTP será fechada e as credenciais serão removidas da memória.
+- Não haverá uma conexão SFTP persistente: cada operação abrirá uma conexão, executará a ação e a fechará em seguida.
+- **Desconectar** removerá a senha, mas manterá nome, host, porta e usuário para permitir uma reconexão posterior.
+- Excluir um servidor removerá todo o cadastro; encerrar a sessão web removerá todos os servidores e credenciais associados.
+- Não há expiração automática. Se o navegador for fechado sem encerrar a sessão, os dados ficarão órfãos na memória até o backend reiniciar.
 - Não haverá bloqueio de arquivos. Operações simultâneas sobre o mesmo caminho poderão causar conflitos.
 
 ## Limitações de segurança
@@ -104,6 +107,7 @@ Por esse motivo:
 - não deve ser publicada diretamente na internet;
 - devem ser utilizadas apenas contas criadas para o ambiente da disciplina;
 - credenciais e dados pessoais não devem aparecer em logs ou mensagens de erro.
+- nesta primeira versão, chaves SSH desconhecidas são aceitas automaticamente e não são persistidas, portanto a identidade do servidor não é protegida contra ataques de intermediário.
 
 HTTPS, autenticação por chave e armazenamento compartilhado de sessões são melhorias previstas para uma possível evolução do projeto.
 
@@ -115,7 +119,7 @@ HTTPS, autenticação por chave e armazenamento compartilhado de sessões são m
 | Servidor SFTP | Ubuntu Server e OpenSSH/SFTP |
 | Frontend | React, TypeScript e Vite |
 | Interface | CSS e Lucide React |
-| Backend | Python, FastAPI e Paramiko |
+| Backend | Python 3.12, FastAPI e Paramiko |
 | Servidor web | NGINX |
 | Inicialização do backend | `systemd` |
 | Protocolo web | HTTP/1.1 |
@@ -131,21 +135,39 @@ O projeto não utiliza banco de dados nem serviços de nuvem pública nesta etap
 | Criação do contêiner LXC com Ubuntu Server | Concluída |
 | Configuração e teste do servidor SFTP | Concluídos |
 | Máquina virtual Ubuntu Server/SFTP no VirtualBox para testes locais | Disponível |
-| Protótipo visual do frontend React | Em desenvolvimento |
-| Integração da interface com dados reais | Pendente |
+| Interface React para sessões e navegação | Concluída |
+| Integração de conexões e listagem de diretórios | Concluída |
 | Criação do segundo contêiner LXC | Pendente |
-| Implementação da API FastAPI/Paramiko | Pendente |
+| API base de sessões e conexões FastAPI/Paramiko | Concluída |
+| Upload, download e mutações de arquivos na API | Concluídos |
 | Configuração do NGINX | Pendente |
 | Criação do serviço `systemd` | Pendente |
 | Implantação e testes integrados no laboratório | Pendente |
 
-No estado atual, os dados exibidos pela interface são simulados. Os botões e indicadores visuais ainda não representam operações reais no servidor SFTP.
+O frontend usa a API para cadastrar servidores, validar credenciais, navegar por diretórios e executar upload, download, criação, movimentação, duplicação, renomeação, alteração de permissões e exclusão.
 
 ## Executando o frontend
+
+### Iniciar tudo de uma vez no Windows
+
+Na raiz do projeto, execute:
+
+```powershell
+.\start-dev.ps1
+```
+
+O script inicia o backend e o frontend no mesmo terminal. Pressione `Ctrl+C` para encerrar os dois processos. Se a política de execução do PowerShell bloquear scripts locais, use:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start-dev.ps1
+```
+
+### Iniciar somente o frontend
 
 Com Node.js e npm instalados:
 
 ```bash
+cd front
 npm install
 npm run dev
 ```
@@ -165,27 +187,76 @@ npm run build
 npm run preview
 ```
 
+## Executando o backend
+
+O backend usa um ambiente virtual e dependências instaladas com `pip`:
+
+```bash
+cd backend
+python -m venv .venv
+
+# Linux
+source .venv/bin/activate
+
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+
+python -m pip install -r requirements-dev.txt
+python -m uvicorn app.main:app --reload
+```
+
+A documentação interativa estará disponível em `http://127.0.0.1:8000/docs`. A aplicação deve sempre usar um único worker enquanto as sessões forem armazenadas em memória.
+
+Para executar os testes:
+
+```bash
+cd backend
+python -m pytest
+```
+
+### API inicial
+
+| Método | Rota | Finalidade |
+| --- | --- | --- |
+| `GET` | `/api/health` | Verificar a disponibilidade da API |
+| `POST` | `/api/connections` | Validar e cadastrar um servidor |
+| `GET` | `/api/connections` | Listar os servidores da sessão |
+| `GET` | `/api/connections/{id}` | Consultar um servidor |
+| `GET` | `/api/connections/{id}/files?path=...` | Listar um diretório remoto |
+| `GET` | `/api/connections/{id}/files/download?path=...` | Baixar um arquivo remoto |
+| `POST` | `/api/connections/{id}/files/upload?path=...` | Enviar um arquivo |
+| `POST` | `/api/connections/{id}/directories` | Criar um diretório |
+| `PATCH` | `/api/connections/{id}/entries/rename` | Renomear arquivo ou diretório |
+| `POST` | `/api/connections/{id}/entries/move` | Mover arquivo ou diretório |
+| `POST` | `/api/connections/{id}/entries/duplicate` | Duplicar arquivo ou diretório |
+| `PATCH` | `/api/connections/{id}/entries/permissions` | Alterar permissões octais |
+| `POST` | `/api/connections/{id}/entries/delete` | Excluir arquivo ou diretório vazio |
+| `PATCH` | `/api/connections/{id}` | Editar e, quando necessário, revalidar o servidor |
+| `POST` | `/api/connections/{id}/disconnect` | Apagar a senha e preservar o cadastro |
+| `POST` | `/api/connections/{id}/connect` | Revalidar com uma nova senha |
+| `DELETE` | `/api/connections/{id}` | Excluir um servidor |
+| `DELETE` | `/api/session` | Encerrar a sessão web e apagar todos os dados |
+
+O cookie `sftp_session` é restrito a `/api`, `HttpOnly` e `SameSite=Strict`. Ele não possui expiração persistente. Como a implantação acadêmica usa HTTP, o atributo `Secure` permanece desativado.
+
 ## Estrutura atual
 
 ```text
 .
-|-- public/                  # Arquivos estáticos
-|-- src/
-|   |-- assets/             # Imagens e recursos visuais
-|   |-- components/
-|   |   |-- ConnectionModal.tsx
-|   |   `-- FileManager.tsx
-|   |-- App.tsx
-|   |-- App.css
-|   |-- index.css
-|   |-- main.tsx
-|   `-- mockData.ts         # Dados temporários da interface
-|-- package.json
-|-- vite.config.ts
+|-- backend/
+|   |-- app/                 # API, modelos, sessões e cliente SFTP
+|   |-- tests/               # Testes isolados com Paramiko simulado
+|   |-- requirements.txt
+|   `-- requirements-dev.txt
+|-- front/
+|   |-- public/              # Arquivos estáticos
+|   |-- src/                 # Aplicação React e cliente da API
+|   |-- package.json
+|   `-- vite.config.ts       # Proxy local de /api para o FastAPI
 `-- README.md
 ```
 
-A estrutura será ampliada com o backend FastAPI e os arquivos de configuração necessários para NGINX e `systemd`.
+A estrutura ainda será ampliada com as operações remotas e os arquivos de configuração necessários para NGINX e `systemd`.
 
 
 ## Contexto acadêmico
