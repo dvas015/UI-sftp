@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 import anyio
 import pytest
 from fastapi.testclient import TestClient
@@ -284,11 +286,24 @@ def test_file_management_endpoints_use_selected_connection(
     connection_id = client.post("/api/connections", json=connection_payload).json()["id"]
     prefix = f"/api/connections/{connection_id}"
 
-    download = client.get(f"{prefix}/files/download", params={"path": "/remote/report.txt"})
+    transfer_id = uuid4()
+    download = client.get(
+        f"{prefix}/files/download",
+        params={"path": "/remote/report.txt", "transfer_id": str(transfer_id)},
+    )
     assert download.status_code == 200
     assert download.content == b"downloaded-content"
     assert "filename*=UTF-8''report.txt" in download.headers["content-disposition"]
     assert download.headers["content-length"] == str(len(b"downloaded-content"))
+    progress = client.get(f"/api/downloads/{transfer_id}")
+    assert progress.status_code == 200
+    assert progress.json() == {
+        "id": str(transfer_id),
+        "status": "completed",
+        "bytes_transferred": len(b"downloaded-content"),
+        "total_bytes": len(b"downloaded-content"),
+        "error": None,
+    }
 
     upload = client.post(
         f"{prefix}/files/upload",
@@ -339,6 +354,20 @@ def test_upload_rejects_multipart_staging_contract(
 
     assert response.status_code == 415
     assert response.json()["error"]["code"] == "unsupported_media_type"
+
+
+def test_download_progress_is_private_to_browser_session(app, connection_payload) -> None:
+    transfer_id = uuid4()
+    with TestClient(app) as owner, TestClient(app) as another_browser:
+        connection_id = owner.post("/api/connections", json=connection_payload).json()["id"]
+        response = owner.get(
+            f"/api/connections/{connection_id}/files/download",
+            params={"path": "/remote/report.txt", "transfer_id": str(transfer_id)},
+        )
+
+        assert response.status_code == 200
+        assert owner.get(f"/api/downloads/{transfer_id}").status_code == 200
+        assert another_browser.get(f"/api/downloads/{transfer_id}").status_code == 404
 
 
 def test_file_management_requires_connected_session(

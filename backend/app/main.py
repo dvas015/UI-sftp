@@ -9,6 +9,7 @@ from .api import router
 from .errors import ApiError
 from .sftp import SftpService
 from .store import SessionStore
+from .transfers import DownloadTracker
 
 
 APP_VERSION = "0.1.0"
@@ -23,10 +24,12 @@ def create_app(
     *,
     session_store: SessionStore | None = None,
     sftp_service: SftpService | None = None,
+    download_tracker: DownloadTracker | None = None,
 ) -> FastAPI:
     application = FastAPI(title="SFTP Explorer API", version=APP_VERSION)
     application.state.session_store = session_store or SessionStore()
     application.state.sftp_service = sftp_service or SftpService()
+    application.state.download_tracker = download_tracker or DownloadTracker()
     application.include_router(router)
 
     @application.exception_handler(ApiError)

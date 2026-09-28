@@ -26,6 +26,7 @@ from .models import (
 )
 from .sftp import SftpService
 from .store import ConnectionRecord, SessionStore
+from .transfers import DownloadTracker
 
 
 SESSION_COOKIE = "sftp_session"
@@ -54,6 +55,10 @@ def _store(request: Request) -> SessionStore:
 
 def _sftp(request: Request) -> SftpService:
     return request.app.state.sftp_service
+
+
+def _download_tracker(request: Request) -> DownloadTracker:
+    return request.app.state.download_tracker
 
 
 def _session_id(request: Request) -> str | None:
@@ -96,17 +101,29 @@ async def _acquire_operation_lock(connection: ConnectionRecord) -> None:
     await connection.operation_lock.acquire()
 
 
-async def _close_download_session(session: object, connection: ConnectionRecord) -> None:
+async def _close_download_session(
+    session: object,
+    connection: ConnectionRecord,
+    tracker: DownloadTracker | None = None,
+    transfer_id: UUID | None = None,
+) -> None:
     try:
         with anyio.CancelScope(shield=True):
             await run_in_threadpool(session.close)  # type: ignore[attr-defined]
     except Exception:
         logger.warning("Failed to close SFTP download session", exc_info=True)
     finally:
+        if tracker is not None and transfer_id is not None:
+            tracker.fail_if_active(transfer_id, "O download foi interrompido antes de terminar.")
         connection.operation_lock.release()
 
 
-async def _download_chunks(session: object, connection: ConnectionRecord, path: str):
+async def _download_chunks(
+    session: object,
+    path: str,
+    tracker: DownloadTracker | None = None,
+    transfer_id: UUID | None = None,
+):
     remaining = session.size  # type: ignore[attr-defined]
     try:
         while remaining > 0:
@@ -117,7 +134,16 @@ async def _download_chunks(session: object, connection: ConnectionRecord, path: 
                 break
             remaining -= len(chunk)
             yield chunk
+            if tracker is not None and transfer_id is not None:
+                tracker.advance(transfer_id, len(chunk))
+        if tracker is not None and transfer_id is not None:
+            if remaining == 0:
+                tracker.complete(transfer_id)
+            else:
+                tracker.fail(transfer_id, "O arquivo remoto terminou antes do tamanho esperado.")
     except BaseException:
+        if tracker is not None and transfer_id is not None:
+            tracker.fail(transfer_id, "A conexão foi interrompida durante o download.")
         logger.info("SFTP download interrupted for %s", path, exc_info=True)
         raise
 
@@ -190,29 +216,60 @@ async def download_remote_file(
     connection_id: UUID,
     request: Request,
     path: str = Query(min_length=1),
+    transfer_id: UUID | None = None,
 ) -> StreamingResponse:
-    connection = _connection(request, connection_id)
-    await _acquire_operation_lock(connection)
+    tracker = _download_tracker(request)
+    owner_session_id = _session_id(request)
+    if transfer_id is not None:
+        if not owner_session_id:
+            raise ApiError(404, "download_not_found", "O download não foi encontrado.")
+        if not tracker.register(transfer_id, owner_session_id):
+            raise ApiError(409, "download_exists", "Esse identificador de download já está em uso.")
+
+    connection: ConnectionRecord | None = None
+    lock_acquired = False
     try:
+        connection = _connection(request, connection_id)
+        await _acquire_operation_lock(connection)
+        lock_acquired = True
         session = await run_in_threadpool(
             _sftp(request).open_download,
             **_credentials(connection),
             path=path,
         )
-    except BaseException:
-        connection.operation_lock.release()
+        if transfer_id is not None:
+            tracker.start(transfer_id, session.size)
+    except BaseException as exc:
+        if transfer_id is not None:
+            message = exc.message if isinstance(exc, ApiError) else "Não foi possível iniciar o download."
+            tracker.fail(transfer_id, message)
+        if connection is not None and lock_acquired:
+            connection.operation_lock.release()
         raise
 
     filename = quote(PurePosixPath(path).name, safe="")
     return ManagedStreamingResponse(
-        _download_chunks(session, connection, path),
+        _download_chunks(session, path, tracker if transfer_id is not None else None, transfer_id),
         media_type="application/octet-stream",
-        cleanup=lambda: _close_download_session(session, connection),
+        cleanup=lambda: _close_download_session(
+            session,
+            connection,
+            tracker if transfer_id is not None else None,
+            transfer_id,
+        ),
         headers={
             "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
             "Content-Length": str(session.size),
         },
     )
+
+
+@router.get("/downloads/{transfer_id}")
+async def get_download_progress(transfer_id: UUID, request: Request) -> dict[str, object]:
+    progress = _download_tracker(request).get(transfer_id, _session_id(request))
+    if progress is None:
+        raise ApiError(404, "download_not_found", "O download não foi encontrado.")
+    return progress
 
 
 @router.post("/connections/{connection_id}/files/upload", status_code=status.HTTP_204_NO_CONTENT)

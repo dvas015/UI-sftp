@@ -13,6 +13,7 @@ export interface AnimatedToast {
   status?: ToastStatus
   duration?: number
   dismissible?: boolean
+  progress?: number
   createdAt?: number
 }
 
@@ -104,6 +105,22 @@ const ToastItem = memo(function ToastItem({ toast, index, onDismiss }: {
               {toast.description && <p>{toast.description}</p>}
             </motion.div>
           </AnimatePresence>
+          {typeof toast.progress === 'number' && (
+            <div
+              className="animated-toast-progress"
+              role="progressbar"
+              aria-label="Progresso do download"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(Math.max(0, Math.min(100, toast.progress)))}
+            >
+              <motion.span
+                initial={false}
+                animate={{ scaleX: Math.max(0, Math.min(100, toast.progress)) / 100 }}
+                transition={reduceMotion ? { duration: 0 } : { duration: 0.25, ease: EASE_OUT }}
+              />
+            </div>
+          )}
         </div>
 
         {canDismiss && (

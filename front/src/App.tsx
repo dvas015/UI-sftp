@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, type Connection, type ConnectionCreateInput, type ConnectionUpdateInput, type DirectoryListing, type RemoteFile } from './api'
+import { api, type Connection, type ConnectionCreateInput, type ConnectionUpdateInput, type DirectoryListing, type DownloadProgress, type RemoteFile } from './api'
 import { ConnectionModal, type ConnectionModalMode } from './components/ConnectionModal'
 import { FileManager, type FolderTab } from './components/FileManager'
 import { AnimatedToastStack } from './components/ui/animated-toast-stack'
@@ -36,6 +36,26 @@ interface OperationFeedback {
 
 function folderTabId(connectionId: string, path: string) {
   return `${connectionId}:${path}`
+}
+
+function formatTransferSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let value = bytes / 1024
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  return `${value.toLocaleString('pt-BR', { maximumFractionDigits: 1 })} ${units[unit]}`
+}
+
+function downloadProgressDescription(progress: DownloadProgress) {
+  if (progress.status === 'preparing' || progress.total_bytes === null) return 'Conectando ao servidor SFTP…'
+  const percentage = progress.total_bytes > 0
+    ? Math.min(100, Math.round((progress.bytes_transferred / progress.total_bytes) * 100))
+    : 100
+  return `${percentage}% · ${formatTransferSize(progress.bytes_transferred)} de ${formatTransferSize(progress.total_bytes)}`
 }
 
 type ApiHealthStatus = 'checking' | 'connected' | 'disconnected'
@@ -378,10 +398,46 @@ function App() {
 
   async function download(file: RemoteFile) {
     if (!activeConnection) return
-    await runFileOperation(
-      () => api.downloadFile(activeConnection.id, file.path, file.name),
-      { successTitle: 'Download iniciado', successDescription: file.name, errorTitle: 'Não foi possível baixar o arquivo', refresh: false },
-    )
+    const toastId = showToast({
+      status: 'loading',
+      title: 'Preparando download…',
+      description: file.size === null ? file.name : `0 B de ${formatTransferSize(file.size)} · ${file.name}`,
+      progress: 0,
+      duration: 0,
+      dismissible: false,
+    })
+    try {
+      await api.downloadFile(activeConnection.id, file.path, file.name, (progress) => {
+        const percentage = progress.total_bytes && progress.total_bytes > 0
+          ? Math.min(100, (progress.bytes_transferred / progress.total_bytes) * 100)
+          : progress.status === 'completed' ? 100 : 0
+        updateToast(toastId, {
+          status: 'loading',
+          title: `Baixando ${file.name}`,
+          description: downloadProgressDescription(progress),
+          progress: percentage,
+          duration: 0,
+          dismissible: false,
+        })
+      })
+      updateToast(toastId, {
+        status: 'success',
+        title: 'Download concluído',
+        description: file.name,
+        progress: 100,
+        duration: 4200,
+        dismissible: true,
+      })
+    } catch (error) {
+      updateToast(toastId, {
+        status: 'error',
+        title: 'Não foi possível baixar o arquivo',
+        description: error instanceof Error ? error.message : 'O download foi interrompido.',
+        progress: undefined,
+        duration: 6000,
+        dismissible: true,
+      })
+    }
   }
 
   async function upload(files: File[]) {

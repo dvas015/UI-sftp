@@ -32,6 +32,14 @@ export interface HealthResponse {
   version: string
 }
 
+export interface DownloadProgress {
+  id: string
+  status: 'preparing' | 'downloading' | 'completed' | 'failed'
+  bytes_transferred: number
+  total_bytes: number | null
+  error: string | null
+}
+
 export interface ConnectionCreateInput {
   name?: string
   host: string
@@ -74,6 +82,18 @@ async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
+function createTransferId() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const value = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`
+}
+
+function wait(milliseconds: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds))
+}
+
 export const api = {
   health: (signal?: AbortSignal) => apiRequest<HealthResponse>('/api/health', { signal }),
   listConnections: () => apiRequest<Connection[]>('/api/connections'),
@@ -92,12 +112,39 @@ export const api = {
     const query = path ? `?${new URLSearchParams({ path })}` : ''
     return apiRequest<DirectoryListing>(`/api/connections/${id}/files${query}`)
   },
-  downloadFile: async (id: string, path: string, name: string) => {
-    const url = `/api/connections/${id}/files/download?${new URLSearchParams({ path })}`
+  downloadFile: async (
+    id: string,
+    path: string,
+    name: string,
+    onProgress?: (progress: DownloadProgress) => void,
+  ) => {
+    const transferId = createTransferId()
+    const query = new URLSearchParams({ path, transfer_id: transferId })
+    const url = `/api/connections/${id}/files/download?${query}`
     const anchor = document.createElement('a')
     anchor.href = url
     anchor.download = name
+    anchor.hidden = true
+    document.body.appendChild(anchor)
     anchor.click()
+    window.setTimeout(() => anchor.remove(), 0)
+
+    const startedAt = Date.now()
+    while (true) {
+      await wait(400)
+      let progress: DownloadProgress
+      try {
+        progress = await apiRequest<DownloadProgress>(`/api/downloads/${transferId}`)
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404 && Date.now() - startedAt < 10_000) continue
+        throw error
+      }
+      onProgress?.(progress)
+      if (progress.status === 'completed') return progress
+      if (progress.status === 'failed') {
+        throw new ApiError('download_failed', progress.error || 'O download foi interrompido.', 502)
+      }
+    }
   },
   uploadFile: (id: string, path: string, file: File, createParents = false) => {
     const query = new URLSearchParams({ path, create_parents: String(createParents) })
