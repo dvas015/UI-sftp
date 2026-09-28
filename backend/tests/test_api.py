@@ -1,5 +1,10 @@
+import anyio
+import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import ClientDisconnect
 
+from app import api as api_module
+from app.api import ManagedStreamingResponse, _close_download_session
 from app.errors import ApiError
 from app.store import ConnectionRecord
 
@@ -188,6 +193,89 @@ def test_internal_record_repr_does_not_expose_password() -> None:
     assert "top-secret" not in repr(record)
 
 
+def test_streaming_response_closes_session_and_releases_lock_on_disconnect() -> None:
+    class Session:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    async def scenario() -> None:
+        record = ConnectionRecord(
+            name="Servidor", host="sftp.internal", port=22, username="deploy",
+            initial_path="/home/deploy", password="top-secret",
+        )
+        session = Session()
+        await record.operation_lock.acquire()
+
+        async def content():
+            yield b"first-chunk"
+
+        async def send(message) -> None:
+            if message["type"] == "http.response.body":
+                raise OSError("client disconnected")
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        response = ManagedStreamingResponse(
+            content(), cleanup=lambda: _close_download_session(session, record),
+        )
+        with pytest.raises(ClientDisconnect):
+            await response(
+                {"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send,
+            )
+
+        assert session.closed is True
+        assert record.operation_lock.locked() is False
+
+    anyio.run(scenario)
+
+
+def test_upload_disconnect_aborts_remote_partial_and_releases_lock(monkeypatch) -> None:
+    class Session:
+        aborted = False
+
+        def write(self, _chunk: bytes) -> int:
+            return len(_chunk)
+
+        def finish(self, _expected_size: int | None = None) -> int:
+            raise AssertionError("finish must not run after a disconnect")
+
+        def abort(self) -> None:
+            self.aborted = True
+
+    class Service:
+        def open_upload(self, **_kwargs):
+            return session
+
+    class StreamingRequest:
+        headers = {"content-type": "application/octet-stream"}
+
+        async def stream(self):
+            yield b"partial"
+            raise ClientDisconnect()
+
+    record = ConnectionRecord(
+        name="Servidor", host="sftp.internal", port=22, username="deploy",
+        initial_path="/home/deploy", password="top-secret",
+    )
+    session = Session()
+    service = Service()
+    monkeypatch.setattr(api_module, "_connection", lambda _request, _connection_id: record)
+    monkeypatch.setattr(api_module, "_sftp", lambda _request: service)
+
+    async def scenario() -> None:
+        with pytest.raises(ClientDisconnect):
+            await api_module.upload_remote_file(
+                record.id, StreamingRequest(), path="/remote/file.bin", create_parents=False,
+            )
+        assert session.aborted is True
+        assert record.operation_lock.locked() is False
+
+    anyio.run(scenario)
+
+
 def test_file_management_endpoints_use_selected_connection(
     client: TestClient,
     connection_payload: dict[str, object],
@@ -199,12 +287,14 @@ def test_file_management_endpoints_use_selected_connection(
     download = client.get(f"{prefix}/files/download", params={"path": "/remote/report.txt"})
     assert download.status_code == 200
     assert download.content == b"downloaded-content"
-    assert 'filename="report.txt"' in download.headers["content-disposition"]
+    assert "filename*=UTF-8''report.txt" in download.headers["content-disposition"]
+    assert download.headers["content-length"] == str(len(b"downloaded-content"))
 
     upload = client.post(
         f"{prefix}/files/upload",
         params={"path": "/remote/folder/report.txt", "create_parents": "true"},
-        files={"file": ("report.txt", b"uploaded-content", "text/plain")},
+        content=b"uploaded-content",
+        headers={"Content-Type": "application/octet-stream"},
     )
     assert upload.status_code == 204
     assert client.post(f"{prefix}/directories", json={"path": "/remote/new"}).status_code == 204
@@ -233,6 +323,22 @@ def test_file_management_endpoints_use_selected_connection(
     upload_call = sftp_service.calls[2]
     assert upload_call["content"] == b"uploaded-content"
     assert upload_call["create_parents"] is True
+
+
+def test_upload_rejects_multipart_staging_contract(
+    client: TestClient,
+    connection_payload: dict[str, object],
+) -> None:
+    connection_id = client.post("/api/connections", json=connection_payload).json()["id"]
+
+    response = client.post(
+        f"/api/connections/{connection_id}/files/upload",
+        params={"path": "/remote/report.txt"},
+        files={"file": ("report.txt", b"uploaded-content", "text/plain")},
+    )
+
+    assert response.status_code == 415
+    assert response.json()["error"]["code"] == "unsupported_media_type"
 
 
 def test_file_management_requires_connected_session(

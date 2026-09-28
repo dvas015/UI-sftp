@@ -4,6 +4,8 @@ from secrets import token_urlsafe
 from threading import RLock
 from uuid import UUID, uuid4
 
+import anyio
+
 from .errors import ApiError
 from .models import ConnectionPublic, ConnectionStatus
 
@@ -20,6 +22,7 @@ class ConnectionRecord:
     status: ConnectionStatus = "connected"
     last_verified_at: datetime | None = field(default_factory=lambda: datetime.now(UTC))
     lock: RLock = field(default_factory=RLock, repr=False)
+    operation_lock: anyio.Lock = field(default_factory=anyio.Lock, repr=False)
 
     def public(self) -> ConnectionPublic:
         with self.lock:
@@ -66,17 +69,19 @@ class SessionStore:
         with self._lock:
             return self._sessions.get(session_id)
 
-    def clear_session(self, session_id: str | None) -> None:
+    async def clear_session(self, session_id: str | None) -> None:
         if not session_id:
             return
         with self._lock:
             session = self._sessions.pop(session_id, None)
         if session is not None:
             with session.lock:
-                for connection in session.connections.values():
+                connections = list(session.connections.values())
+                session.connections.clear()
+            for connection in connections:
+                async with connection.operation_lock:
                     with connection.lock:
                         connection.password = None
-                session.connections.clear()
 
     @staticmethod
     def add_connection(session: BrowserSession, connection: ConnectionRecord) -> None:
@@ -102,12 +107,13 @@ class SessionStore:
         return connection
 
     @staticmethod
-    def delete_connection(session: BrowserSession | None, connection_id: UUID) -> None:
+    async def delete_connection(session: BrowserSession | None, connection_id: UUID) -> None:
         if session is None:
             raise ApiError(404, "connection_not_found", "Conexão não encontrada.")
         with session.lock:
             connection = session.connections.pop(connection_id, None)
         if connection is None:
             raise ApiError(404, "connection_not_found", "Conexão não encontrada.")
-        with connection.lock:
-            connection.password = None
+        async with connection.operation_lock:
+            with connection.lock:
+                connection.password = None

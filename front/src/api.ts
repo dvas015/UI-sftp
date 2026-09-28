@@ -93,25 +93,19 @@ export const api = {
     return apiRequest<DirectoryListing>(`/api/connections/${id}/files${query}`)
   },
   downloadFile: async (id: string, path: string, name: string) => {
-    const response = await fetch(`/api/connections/${id}/files/download?${new URLSearchParams({ path })}`, {
-      credentials: 'same-origin',
-    })
-    if (!response.ok) {
-      const body = await response.json().catch(() => null) as { error?: { code?: string; message?: string } } | null
-      throw new ApiError(body?.error?.code || 'request_failed', body?.error?.message || 'Não foi possível baixar o arquivo.', response.status)
-    }
-    const url = URL.createObjectURL(await response.blob())
+    const url = `/api/connections/${id}/files/download?${new URLSearchParams({ path })}`
     const anchor = document.createElement('a')
     anchor.href = url
     anchor.download = name
     anchor.click()
-    URL.revokeObjectURL(url)
   },
   uploadFile: (id: string, path: string, file: File, createParents = false) => {
     const query = new URLSearchParams({ path, create_parents: String(createParents) })
-    const form = new FormData()
-    form.append('file', file, file.name)
-    return apiRequest<void>(`/api/connections/${id}/files/upload?${query}`, { method: 'POST', body: form })
+    return apiRequest<void>(`/api/connections/${id}/files/upload?${query}`, {
+      method: 'POST',
+      body: file,
+      headers: { 'Content-Type': 'application/octet-stream' },
+    })
   },
   createDirectory: (id: string, path: string) => apiRequest<void>(`/api/connections/${id}/directories`, {
     method: 'POST', body: JSON.stringify({ path }),

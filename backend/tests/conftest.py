@@ -3,6 +3,7 @@ from collections.abc import Iterator
 import pytest
 from fastapi.testclient import TestClient
 
+from app.errors import ApiError
 from app.main import create_app
 from app.models import DirectoryListing
 from app.sftp import SftpValidationResult
@@ -33,15 +34,21 @@ class FakeSftpService:
             raise self.error
         return DirectoryListing(path=path, items=[])
 
-    def download_file(self, *, destination, path: str, **credentials) -> None:
+    def open_download(self, *, path: str, **credentials):
+        if self.error is not None:
+            raise self.error
         self.calls.append({"operation": "download", "path": path, **credentials})
-        destination.write(b"downloaded-content")
+        return FakeDownloadSession(b"downloaded-content")
 
-    def upload_file(self, *, source, path: str, size: int, create_parents: bool, **credentials) -> None:
-        self.calls.append({
-            "operation": "upload", "path": path, "size": size,
-            "create_parents": create_parents, "content": source.read(), **credentials,
-        })
+    def open_upload(self, *, path: str, create_parents: bool, **credentials):
+        if self.error is not None:
+            raise self.error
+        call = {
+            "operation": "upload", "path": path, "size": 0,
+            "create_parents": create_parents, "content": b"", **credentials,
+        }
+        self.calls.append(call)
+        return FakeUploadSession(call)
 
     def create_directory(self, *, path: str, **credentials) -> None:
         self.calls.append({"operation": "mkdir", "path": path, **credentials})
@@ -63,6 +70,45 @@ class FakeSftpService:
 
     def delete_entry(self, *, path: str, **credentials) -> None:
         self.calls.append({"operation": "delete", "path": path, **credentials})
+
+
+class FakeDownloadSession:
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+        self.size = len(content)
+        self.offset = 0
+        self.closed = False
+
+    def read(self, size: int) -> bytes:
+        chunk = self.content[self.offset:self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeUploadSession:
+    def __init__(self, call: dict[str, object]) -> None:
+        self.call = call
+        self.content = bytearray()
+        self.closed = False
+
+    def write(self, chunk: bytes) -> int:
+        self.content.extend(chunk)
+        return len(chunk)
+
+    def finish(self, expected_size: int | None = None) -> int:
+        size = len(self.content)
+        if expected_size is not None and size != expected_size:
+            raise ApiError(400, "upload_size_mismatch", "O tamanho recebido não corresponde ao tamanho informado.")
+        self.call["content"] = bytes(self.content)
+        self.call["size"] = size
+        self.closed = True
+        return size
+
+    def abort(self) -> None:
+        self.closed = True
 
 
 @pytest.fixture

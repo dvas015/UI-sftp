@@ -2,7 +2,7 @@ import socket
 import stat
 import errno
 from io import BytesIO
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import paramiko
 import pytest
@@ -114,6 +114,10 @@ def test_list_directory_returns_sorted_metadata_and_closes_connection(ssh_client
 @patch("app.sftp.paramiko.SSHClient")
 def test_file_transfer_and_mutation_operations_delegate_to_sftp(ssh_client_class: MagicMock) -> None:
     sftp = ssh_client_class.return_value.open_sftp.return_value
+    remote_file = sftp.open.return_value
+    uploaded = paramiko.SFTPAttributes()
+    uploaded.st_size = 6
+    sftp.stat.return_value = uploaded
     service = SftpService()
     credentials = {"host": "server", "port": 22, "username": "deploy", "password": "secret"}
 
@@ -124,11 +128,156 @@ def test_file_transfer_and_mutation_operations_delegate_to_sftp(ssh_client_class
     assert service.move_entry(**credentials, path="/remote/renamed.txt", destination="/archive") == "/archive/renamed.txt"
     service.change_permissions(**credentials, path="/archive/renamed.txt", mode="0640")
 
-    sftp.putfo.assert_called_once_with(source, "/remote/file.txt", file_size=6, confirm=True)
+    temporary_path = sftp.open.call_args.args[0]
+    assert temporary_path.startswith("/remote/.file.txt.upload-")
+    sftp.open.assert_called_once_with(temporary_path, "wbx", bufsize=0)
+    remote_file.write.assert_called_once_with(b"upload")
+    sftp.posix_rename.assert_called_once_with(temporary_path, "/remote/file.txt")
     sftp.mkdir.assert_called_once_with("/remote/new")
     assert sftp.rename.call_args_list[0].args == ("/remote/file.txt", "/remote/renamed.txt")
     assert sftp.rename.call_args_list[1].args == ("/remote/renamed.txt", "/archive/renamed.txt")
     sftp.chmod.assert_called_once_with("/archive/renamed.txt", 0o640)
+
+
+@patch("app.sftp.paramiko.SSHClient")
+def test_open_download_reads_bounded_chunks_and_closes_every_resource(ssh_client_class: MagicMock) -> None:
+    client = ssh_client_class.return_value
+    sftp = client.open_sftp.return_value
+    remote_file = sftp.open.return_value
+    attributes = paramiko.SFTPAttributes()
+    attributes.st_mode = stat.S_IFREG | 0o644
+    attributes.st_size = 7
+    sftp.stat.return_value = attributes
+    remote_file.read.side_effect = [b"abcd", b"efg", b""]
+
+    session = SftpService().open_download(
+        host="server", port=22, username="deploy", password="secret", path="/remote/file.bin",
+    )
+
+    assert session.size == 7
+    assert session.read(4) == b"abcd"
+    assert session.read(4) == b"efg"
+    assert session.read(4) == b""
+    session.close()
+    session.close()
+
+    assert remote_file.read.call_args_list == [call(4), call(4), call(4)]
+    sftp.open.assert_called_once_with("/remote/file.bin", "rb", bufsize=0)
+    remote_file.close.assert_called_once()
+    sftp.close.assert_called_once()
+    client.close.assert_called_once()
+
+
+@patch("app.sftp.paramiko.SSHClient")
+def test_download_read_maps_failure_without_hiding_required_cleanup(ssh_client_class: MagicMock) -> None:
+    client = ssh_client_class.return_value
+    sftp = client.open_sftp.return_value
+    remote_file = sftp.open.return_value
+    attributes = paramiko.SFTPAttributes()
+    attributes.st_mode = stat.S_IFREG | 0o644
+    attributes.st_size = 10
+    sftp.stat.return_value = attributes
+    remote_file.read.side_effect = socket.timeout("late")
+    session = SftpService().open_download(
+        host="server", port=22, username="deploy", password="secret", path="/remote/file.bin",
+    )
+
+    with pytest.raises(ApiError) as captured:
+        session.read(4096)
+    session.close()
+
+    assert captured.value.status_code == 504
+    assert captured.value.code == "sftp_timeout"
+    remote_file.close.assert_called_once()
+    sftp.close.assert_called_once()
+    client.close.assert_called_once()
+
+
+@patch("app.sftp.paramiko.SSHClient")
+def test_upload_stream_writes_chunks_then_atomically_publishes_and_closes(ssh_client_class: MagicMock) -> None:
+    client = ssh_client_class.return_value
+    sftp = client.open_sftp.return_value
+    remote_file = sftp.open.return_value
+    attributes = paramiko.SFTPAttributes()
+    attributes.st_size = 6
+    sftp.stat.return_value = attributes
+    session = SftpService().open_upload(
+        host="server", port=22, username="deploy", password="secret", path="/remote/file.bin",
+    )
+
+    assert session.write(b"abc") == 3
+    assert session.write(b"def") == 3
+    assert session.finish(expected_size=6) == 6
+    session.close()
+
+    assert remote_file.write.call_args_list == [call(b"abc"), call(b"def")]
+    remote_file.close.assert_called_once()
+    sftp.stat.assert_called_once_with(session.temporary_path)
+    sftp.posix_rename.assert_called_once_with(session.temporary_path, "/remote/file.bin")
+    sftp.remove.assert_not_called()
+    sftp.close.assert_called_once()
+    client.close.assert_called_once()
+
+
+@patch("app.sftp.paramiko.SSHClient")
+def test_upload_abort_removes_partial_remote_file_and_closes_resources(ssh_client_class: MagicMock) -> None:
+    client = ssh_client_class.return_value
+    sftp = client.open_sftp.return_value
+    remote_file = sftp.open.return_value
+    session = SftpService().open_upload(
+        host="server", port=22, username="deploy", password="secret", path="/remote/file.bin",
+    )
+    temporary_path = session.temporary_path
+
+    session.write(b"partial")
+    session.abort()
+    session.abort()
+
+    sftp.remove.assert_called_once_with(temporary_path)
+    remote_file.close.assert_called_once()
+    sftp.close.assert_called_once()
+    client.close.assert_called_once()
+
+
+@patch("app.sftp.paramiko.SSHClient")
+def test_upload_write_failure_aborts_partial_remote_file(ssh_client_class: MagicMock) -> None:
+    client = ssh_client_class.return_value
+    sftp = client.open_sftp.return_value
+    remote_file = sftp.open.return_value
+    remote_file.write.side_effect = OSError("connection lost")
+    session = SftpService().open_upload(
+        host="server", port=22, username="deploy", password="secret", path="/remote/file.bin",
+    )
+
+    with pytest.raises(ApiError) as captured:
+        session.write(b"partial")
+
+    assert captured.value.status_code == 502
+    assert captured.value.code == "sftp_unavailable"
+    sftp.remove.assert_called_once_with(session.temporary_path)
+    remote_file.close.assert_called_once()
+    sftp.close.assert_called_once()
+    client.close.assert_called_once()
+
+
+@patch("app.sftp.paramiko.SSHClient")
+def test_upload_size_mismatch_aborts_without_replacing_destination(ssh_client_class: MagicMock) -> None:
+    client = ssh_client_class.return_value
+    sftp = client.open_sftp.return_value
+    session = SftpService().open_upload(
+        host="server", port=22, username="deploy", password="secret", path="/remote/file.bin",
+    )
+    session.write(b"short")
+
+    with pytest.raises(ApiError) as captured:
+        session.finish(expected_size=10)
+
+    assert captured.value.status_code == 400
+    assert captured.value.code == "upload_size_mismatch"
+    sftp.remove.assert_called_once_with(session.temporary_path)
+    sftp.posix_rename.assert_not_called()
+    sftp.close.assert_called_once()
+    client.close.assert_called_once()
 
 
 @patch("app.sftp.paramiko.SSHClient")
